@@ -37,7 +37,31 @@ _BACKEND_ROUTE_PATTERNS = [
         r"""\bpath\(\s*(?P<quote>['"])(?P<path>[^'"]+)(?P=quote)""",
         re.IGNORECASE | re.VERBOSE,
     ),
+    # Go net/http handlers: http.HandleFunc("/path", ...)
+    re.compile(
+        r"""\bhttp\.HandleFunc\(\s*(?P<quote>['"])(?P<path>[^'"]+)(?P=quote)""",
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    # Gin router: r.GET("/path", ...)
+    re.compile(
+        r"""\b\w+\.(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\(
+        \s*(?P<quote>['"])(?P<path>[^'"]+)(?P=quote)""",
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    # Chi router: r.Method("GET", "/path", ...)
+    re.compile(
+        r"""\b\w+\.Method\(\s*(?P<quote>['"])(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?P=quote)
+        \s*,\s*(?P<quote2>['"])(?P<path>[^'"]+)(?P=quote2)""",
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    # gRPC proto: rpc Foo(Req) returns (Res);
+    re.compile(
+        r"""\brpc\s+(?P<rpc>\w+)\s*\(""",
+        re.IGNORECASE | re.VERBOSE,
+    ),
 ]
+
+_GRPC_SERVICE_RE = re.compile(r"""\bservice\s+(?P<service>\w+)\s*\{""", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -49,6 +73,9 @@ class EndpointChange:
     change_type: str
     file_path: str | None
     line_number: int | None
+    protocol: str = "http"
+    grpc_service: str | None = None
+    grpc_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +168,7 @@ def _extract_endpoint_changes(diff_text: str) -> list[EndpointChange]:
     current_file = None
     old_line = None
     new_line = None
+    grpc_service = None
     changes: list[EndpointChange] = []
 
     for raw_line in diff_text.splitlines():
@@ -162,12 +190,14 @@ def _extract_endpoint_changes(diff_text: str) -> list[EndpointChange]:
 
         if raw_line.startswith("+") and not raw_line.startswith("+++"):
             content = raw_line[1:]
+            grpc_service = _update_grpc_service(content, grpc_service)
             changes.extend(
                 _extract_changes_from_line(
                     content,
                     "added",
                     current_file,
                     new_line,
+                    grpc_service,
                 )
             )
             if new_line is not None:
@@ -176,12 +206,14 @@ def _extract_endpoint_changes(diff_text: str) -> list[EndpointChange]:
 
         if raw_line.startswith("-") and not raw_line.startswith("---"):
             content = raw_line[1:]
+            grpc_service = _update_grpc_service(content, grpc_service)
             changes.extend(
                 _extract_changes_from_line(
                     content,
                     "removed",
                     current_file,
                     old_line,
+                    grpc_service,
                 )
             )
             if old_line is not None:
@@ -189,6 +221,7 @@ def _extract_endpoint_changes(diff_text: str) -> list[EndpointChange]:
             continue
 
         if raw_line.startswith(" "):
+            grpc_service = _update_grpc_service(raw_line[1:], grpc_service)
             if old_line is not None:
                 old_line += 1
             if new_line is not None:
@@ -202,11 +235,29 @@ def _extract_changes_from_line(
     change_type: str,
     file_path: str | None,
     line_number: int | None,
+    grpc_service: str | None,
 ) -> list[EndpointChange]:
     changes: list[EndpointChange] = []
     for pattern in _BACKEND_ROUTE_PATTERNS:
         match = pattern.search(content)
         if not match:
+            continue
+
+        if match.groupdict().get("rpc"):
+            rpc_name = match.group("rpc")
+            grpc_path = _format_grpc_path(grpc_service, rpc_name)
+            changes.append(
+                EndpointChange(
+                    method=None,
+                    path=grpc_path,
+                    change_type=change_type,
+                    file_path=file_path,
+                    line_number=line_number,
+                    protocol="grpc",
+                    grpc_service=grpc_service,
+                    grpc_method=rpc_name,
+                )
+            )
             continue
 
         method = match.groupdict().get("method")
@@ -238,7 +289,7 @@ def _find_call_sites(
     changed_files_set: set[str],
     options: ImpactAnalysisOptions,
 ) -> list[CallSite]:
-    regex_pattern = _build_callsite_regex(change.path)
+    regex_pattern = _build_callsite_regex(change)
     results, _ = search_service.search_regex(
         pattern=regex_pattern,
         page_size=options.callsite_page_size,
@@ -261,8 +312,11 @@ def _find_call_sites(
     return call_sites
 
 
-def _build_callsite_regex(path: str) -> str:
-    normalized = path.strip()
+def _build_callsite_regex(change: EndpointChange) -> str:
+    if change.protocol == "grpc":
+        return _build_grpc_callsite_regex(change)
+
+    normalized = change.path.strip()
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
 
@@ -272,4 +326,34 @@ def _build_callsite_regex(path: str) -> str:
     escaped = re.sub(r"\\<[^>]+\\>", r"[^/]+", escaped)
     escaped = escaped.replace("\\*", ".*")
 
-    return escaped
+    axios_pattern = rf"axios\.(?:{_METHODS_PATTERN})\(\s*{_wrap_quotes(escaped)}"
+    axios_config_pattern = rf"axios\(\s*\{{[^}}]*{_wrap_quotes(escaped)}"
+    return rf"(?:{escaped}|{axios_pattern}|{axios_config_pattern})"
+
+
+def _build_grpc_callsite_regex(change: EndpointChange) -> str:
+    if change.grpc_service and change.grpc_method:
+        grpc_target = re.escape(f"{change.grpc_service}/{change.grpc_method}")
+        return rf"(?:{grpc_target}|{re.escape(change.grpc_method)})"
+
+    return re.escape(change.path)
+
+
+def _update_grpc_service(content: str, current_service: str | None) -> str | None:
+    service_match = _GRPC_SERVICE_RE.search(content)
+    if not service_match:
+        return current_service
+    return service_match.group("service")
+
+
+def _format_grpc_path(service: str | None, rpc_name: str) -> str:
+    if service:
+        return f"{service}/{rpc_name}"
+    return rpc_name
+
+
+def _wrap_quotes(pattern: str) -> str:
+    return rf"(?:['\"]){pattern}(?:['\"])"
+
+
+_METHODS_PATTERN = "|".join(_METHODS)
