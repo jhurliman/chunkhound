@@ -286,18 +286,31 @@ class DuckDBConnectionManager:
         if self.connection is None:
             raise RuntimeError("No database connection")
 
+        vss_loaded = False
         try:
-            # Install and load VSS extension for vector operations
-            self.connection.execute("INSTALL vss")
-            self.connection.execute("LOAD vss")
-            logger.info("VSS extension loaded successfully")
+            if os.environ.get("CHUNKHOUND_MCP_MODE"):
+                self.connection.execute("LOAD vss")
+                vss_loaded = True
+                logger.info("VSS extension loaded successfully (no install in MCP)")
+            else:
+                # Install and load VSS extension for vector operations
+                self.connection.execute("INSTALL vss")
+                self.connection.execute("LOAD vss")
+                vss_loaded = True
+                logger.info("VSS extension loaded successfully")
 
-            # Enable experimental HNSW persistence AFTER VSS extension is loaded
-            # This prevents segfaults when DuckDB tries to access vector functionality
-            self.connection.execute("SET hnsw_enable_experimental_persistence = true")
-            logger.debug("HNSW experimental persistence enabled")
+            if vss_loaded:
+                # Enable experimental HNSW persistence AFTER VSS extension is loaded
+                # This prevents segfaults when DuckDB tries to access vector functionality
+                self.connection.execute(
+                    "SET hnsw_enable_experimental_persistence = true"
+                )
+                logger.debug("HNSW experimental persistence enabled")
 
         except Exception as e:
+            if os.environ.get("CHUNKHOUND_MCP_MODE"):
+                logger.warning(f"Skipping VSS extension load in MCP mode: {e}")
+                return
             logger.error(f"Failed to load DuckDB extensions: {e}")
             raise
 

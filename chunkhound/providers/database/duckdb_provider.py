@@ -131,9 +131,20 @@ class DuckDBProvider(SerialDatabaseProvider):
         conn = duckdb.connect(str(self._connection_manager.db_path))
 
         # Load required extensions
-        conn.execute("INSTALL vss")
-        conn.execute("LOAD vss")
-        conn.execute("SET hnsw_enable_experimental_persistence = true")
+        vss_loaded = False
+        if os.environ.get("CHUNKHOUND_MCP_MODE"):
+            try:
+                conn.execute("LOAD vss")
+                vss_loaded = True
+            except Exception as e:
+                logger.warning(f"Skipping VSS extension load in MCP mode: {e}")
+        else:
+            conn.execute("INSTALL vss")
+            conn.execute("LOAD vss")
+            vss_loaded = True
+
+        if vss_loaded:
+            conn.execute("SET hnsw_enable_experimental_persistence = true")
 
         logger.debug(
             f"Created new DuckDB connection in executor thread {threading.get_ident()}"
